@@ -1,0 +1,238 @@
+#!/usr/bin/python3
+import logging, configparser
+import time, sys
+
+#导入自定义包
+sys.path.append("/usr/local/cmdb")
+from aliyun import *
+from bkcmdb import *
+
+
+class MainCmdb():
+    """cmdb的管理，数据只会覆盖从源头采集到的字段
+
+    argvs:
+        CONF_SITE: 配置文件所在的位置
+    """
+
+    def __init__(self,CONF_SITE):
+        #日志
+        logging.basicConfig(level=logging.INFO,
+            format='%(asctime)s %(funcName)s %(levelname)s %(message)s',
+            datefmt='%Y-%m-%d %A %H:%M:%S')
+        self.logging = logging
+
+        #读取配置文件
+        self.cfg = configparser.ConfigParser()
+        self.cfg.read(CONF_SITE)
+        self.allow_cmdb_sync = self.cfg['bk']['allow_cmdb_sync']
+
+        #初始化类
+        self.aliyun_inst = AliYun(CONF_SITE)
+        self.bkcmdb_inst = BkCmdb(CONF_SITE)
+
+        #SLB专属转发策略字典
+        self.slb_forward_dict = {}
+
+    def update_domain(self):
+        """更新域名"""
+
+        #公共列表初始化
+        bk_obj_id = "bk_domain"
+
+        #先获取一级域名的列表
+        dns_name_list = self.aliyun_inst.get_dns_name()
+        for dns_name in  dns_name_list:
+            #有的域名没记录，就跳过
+            dns_recording_list = self.aliyun_inst.get_dns_recording(dns_name)
+            if not dns_recording_list:
+                logging.info("域名" + dns_name + "为空，跳过后续")
+                continue
+
+            #根据二级域名的信息，添加域名实例
+            for dns_info in dns_recording_list:
+                if dns_info["Status"] == "ENABLE" and dns_info["Locked"] != "False":
+                    if dns_info["Type"] == "CNAME" or dns_info["Type"] == "A":
+                        #添加域名和关联信息
+                        child_dns_name = dns_info["RR"] + "." + dns_name
+                        inq_dict = {"bk_obj_id":bk_obj_id, "bk_inst_name" : child_dns_name}
+                        self.bkcmdb_inst.add_inst(inq_dict)
+                        self.bkcmdb_inst.add_asst(bk_obj_id, child_dns_name, dns_info["Value"])
+
+    def update_slb(self):
+        """更新SLB"""
+
+        slb_id_list = self.aliyun_inst.get_slb_id()
+        for slb_id in slb_id_list:
+            slb_info_dict = self.aliyun_inst.get_slb_recording(slb_id)
+            #去除端口字典
+            bk_port_dict = slb_info_dict["bk_port_dict"]
+            self.slb_forward_dict[slb_id]  = bk_port_dict
+            del slb_info_dict["bk_port_dict"]
+            bk_port = ', '.join(bk_port_dict.keys())
+
+            slb_info_dict["bk_port"] = bk_port
+            slb_info_dict["bk_obj_id"] = "bk_slb"
+            self.bkcmdb_inst.add_inst(slb_info_dict)
+
+    def update_slb_strategy(self):
+        """更新SLB转发策略，需要先更新SLB才行"""
+
+        bk_obj_id = "bk_slb_strategy"
+
+        for slb_id,bk_port_dict in self.slb_forward_dict.items():
+            #添加转发策略
+            for port,protocol in bk_port_dict.items():
+                if protocol == "http":
+                    rsp_info_dict = self.aliyun_inst.get_slb_http(slb_id, port)
+                elif protocol == "https":
+                    rsp_info_dict = self.aliyun_inst.get_slb_https(slb_id, port)
+                elif protocol == "tcp":
+                    rsp_info_dict = self.aliyun_inst.get_slb_tcp(slb_id, port)
+
+                #创建实例
+                for rsp_name,rsp_id in rsp_info_dict.items():
+                    if rsp_name == "all" and rsp_id == "None":
+                        self.logging.warn("实例" + slb_id + "的" + port + "端口请使用虚拟服务器组进行转发")
+                        continue
+
+                    if  rsp_name == "all" and rsp_id != "None":
+                        bk_inst_name = protocol + "://" + slb_id + ":" + port
+                    else:
+                        bk_inst_name = protocol + "://" + rsp_name + ":" + port
+
+                    inq_dict = {"bk_obj_id":bk_obj_id, "bk_inst_name":bk_inst_name, "bk_rsp_id":rsp_id, "bk_port":port, "bk_protocol": protocol}
+                    self.bkcmdb_inst.add_inst(inq_dict)
+                    self.bkcmdb_inst.add_asst("bk_slb", slb_id, bk_inst_name)
+                    
+                    #添加和主机的关联
+                    if rsp_id != "None":
+                        for ecs_id in self.aliyun_inst.get_slb_rsp(rsp_id).keys():
+                            self.bkcmdb_inst.add_asst(bk_obj_id, bk_inst_name, ecs_id)
+
+    def update_ddos(self):
+        """更新DDOS高防信息"""
+        ddos_domain_list = self.aliyun_inst.get_ddos_domain()
+        for ddos_domain in ddos_domain_list:
+            ddos_info_dict = self.aliyun_inst.get_ddos_info(ddos_domain)
+
+            #将列表剔除
+            ddos_source_list = ddos_info_dict["ddos_source_list"]
+            del ddos_info_dict["ddos_source_list"]
+            ddos_info_dict["bk_obj_id"] = "bk_ddos"
+            bk_inst_name = ddos_info_dict["bk_inst_name"]
+            self.bkcmdb_inst.add_inst(ddos_info_dict)
+
+            #循环添加关联关系
+            for src_name in ddos_source_list:
+                self.bkcmdb_inst.add_asst("bk_ddos", bk_inst_name, src_name)
+
+    def update_waf(self):
+        """更新DDOS高防信息"""
+
+        waf_domain_list = self.aliyun_inst.get_waf_domain()
+        for waf_domain in waf_domain_list:
+            waf_info_dict = self.aliyun_inst.get_waf_info(waf_domain)
+
+            #创建实例
+            src_ip_list = waf_info_dict["src_ip_list"]
+            del waf_info_dict["src_ip_list"]
+            waf_info_dict["bk_obj_id"] = "bk_waf"
+            self.bkcmdb_inst.add_inst(waf_info_dict)
+
+            #添加关联
+            for bk_inst_name in src_ip_list:
+                self.bkcmdb_inst.add_asst("bk_waf", waf_info_dict["bk_inst_name"], bk_inst_name)
+
+    def update_rds(self):
+        """更新RDS数据"""
+
+        for rds_id in self.aliyun_inst.get_rds_id():
+            rds_info_dict = self.aliyun_inst.get_rds_info(rds_id)
+            rds_info_dict["bk_inst_name"] = rds_id
+            rds_info_dict["bk_obj_id"] = "bk_rds"
+
+            self.bkcmdb_inst.add_inst(rds_info_dict)
+
+    def update_drds(self):
+        """更新drds数据"""
+
+        for drds_id in self.aliyun_inst.get_drds_id():
+            drds_info_dict = self.aliyun_inst.get_drds_info(drds_id)
+            drds_info_dict["bk_obj_id"] = "bk_drds"
+
+            self.bkcmdb_inst.add_inst(drds_info_dict)
+
+    def update_redis(self):
+        """更新redis数据"""
+
+        for redis_id in self.aliyun_inst.get_redis_id():
+            redis_info_dict = self.aliyun_inst.get_redis_info(redis_id)
+            redis_info_dict["bk_obj_id"] = "bk_redis"
+
+            self.bkcmdb_inst.add_inst(redis_info_dict)
+
+    def update_edas(self):
+        """更新edas数据"""
+
+        for tmp_dict in self.aliyun_inst.get_edas_id():
+            edas_id = tmp_dict["edas_id"]
+            tomcat_info_dict = self.aliyun_inst.get_edas_tomcat(edas_id)
+            jvm_info_dict = self.aliyun_inst.get_edas_jvm(edas_id)
+            edas_info_dict = dict(tomcat_info_dict, **jvm_info_dict)
+            edas_info_dict["bk_obj_id"] = "bk_edas"
+            edas_info_dict["bk_inst_name"] = edas_id
+            edas_info_dict["bk_edas_name"] = tmp_dict["edas_name"]
+            edas_info_dict["bk_edas_type"] = tmp_dict["edas_type"]
+
+            self.bkcmdb_inst.add_inst(edas_info_dict)
+            time.sleep(3)
+
+    def add_all(self):
+        """循环添加对应信息"""
+
+        func_dict = {
+            'bk_domain': self.update_domain,
+            'bk_slb': self.update_slb,
+            'bk_slb_strategy': self.update_slb_strategy,
+            'bk_ddos': self.update_ddos,
+            'bk_waf': self.update_waf,
+            'bk_rds': self.update_rds,
+            'bk_drds': self.update_drds,
+            'bk_redis': self.update_redis,
+            'bk_edas': self.update_edas,
+        }
+
+        #先添加VPC信息
+        self.aliyun_inst.vpc_info_dict = self.aliyun_inst.get_vpc()
+
+        allow_id_list = self.allow_cmdb_sync.split(',')
+        for bk_obj_id in allow_id_list:
+            self.bkcmdb_inst.public_inst_dict[bk_obj_id] = []
+            self.bkcmdb_inst.public_asst_dict[bk_obj_id] = []
+            self.logging.info("开始更新" + bk_obj_id + "模型信息")
+            func_dict[bk_obj_id]()
+
+    def clear_all(self):
+        """先清理一遍关联关系，再清理实例"""
+
+        for bk_obj_id in self.bkcmdb_inst.public_asst_dict.keys():
+            real_asst_list = self.bkcmdb_inst.public_asst_dict[bk_obj_id]
+            self.bkcmdb_inst.clear_asst(bk_obj_id, real_asst_list)
+
+        for bk_obj_id in self.bkcmdb_inst.public_inst_dict.keys():
+            real_inst_list = self.bkcmdb_inst.public_inst_dict[bk_obj_id]
+            self.bkcmdb_inst.clear_inst(bk_obj_id, real_inst_list)
+
+    def test(self):
+        pass
+
+def main():
+    CONF_SITE="/usr/local/cmdb/script_conf.cfg"
+
+    cmdb_main_inst = MainCmdb(CONF_SITE)
+    cmdb_main_inst.add_all()
+    cmdb_main_inst.clear_all()
+   
+
+main()
